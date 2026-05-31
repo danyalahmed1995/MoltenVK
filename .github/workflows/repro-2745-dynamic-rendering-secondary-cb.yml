@@ -2,6 +2,9 @@ name: Repro 2745 Dynamic Rendering Secondary CB
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - repro-2745-ci-metal-test
 
 jobs:
   repro:
