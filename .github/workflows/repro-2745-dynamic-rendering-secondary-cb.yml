@@ -577,12 +577,9 @@ jobs:
             find ../Package -path '*MoltenVK*' \( -name 'libMoltenVK.dylib' -o -name 'MoltenVK_icd.json' \) -print
           } | tee logs/loader-paths.log
 
-          status=0
-
-          for prefill in 0 1 2; do
-            log="logs/run-prefill-${prefill}.log"
-            echo "Running with MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=${prefill}" | tee "${log}"
-            run_env=(
+          make_repro_env() {
+            local prefill="$1"
+            repro_env=(
               "DYLD_LIBRARY_PATH=${MVK_LIB_DIR}:${DYLD_LIBRARY_PATH:-}"
               "MVK_DYLIB_PATH=${MVK_DYLIB}"
               "MVK_ICD_JSON_PATH=${MVK_ICD_JSON}"
@@ -591,17 +588,77 @@ jobs:
               "MVK_CONFIG_DEBUG=1"
             )
             if [ -n "${MVK_ICD_JSON}" ] && [ -f "${MVK_ICD_JSON}" ]; then
-              run_env+=("VK_ICD_FILENAMES=${MVK_ICD_JSON}")
+              repro_env+=("VK_ICD_FILENAMES=${MVK_ICD_JSON}")
             fi
+          }
+
+          status=0
+          prefill_1_status=0
+
+          for prefill in 0 1 2; do
+            log="logs/run-prefill-${prefill}.log"
+            echo "Running with MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=${prefill}" | tee "${log}"
+            make_repro_env "${prefill}"
             set +e
-            env "${run_env[@]}" ./repro_2745 >> "${log}" 2>&1
+            env "${repro_env[@]}" ./repro_2745 >> "${log}" 2>&1
             rc=$?
             set -e
             echo "exit=${rc}" | tee -a "${log}"
+            if [ "${prefill}" = "1" ]; then
+              prefill_1_status="${rc}"
+            fi
             if [ "${rc}" -ne 0 ]; then
               status="${rc}"
             fi
           done
+
+          if [ "${prefill_1_status}" -ne 0 ]; then
+            lldb_log="logs/lldb-prefill-1.log"
+            stdout_log="logs/lldb-prefill-1-repro-output.log"
+            make_repro_env 1
+            {
+              echo "LLDB rerun for MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=1"
+              echo "Command:"
+              printf 'env'
+              for item in "${repro_env[@]}"; do
+                printf ' %q' "${item}"
+              done
+              printf ' lldb --batch'
+              printf ' %q' '-o'
+              printf ' %q' 'settings set target.process.thread.step-avoid-regexp ^std::'
+              printf ' %q' '-o'
+              printf ' %q' "settings set target.output-path ${stdout_log}"
+              printf ' %q' '-o'
+              printf ' %q' "settings set target.error-path ${stdout_log}"
+              printf ' %q' '-o'
+              printf ' %q' 'run'
+              printf ' %q' '-o'
+              printf ' %q' 'thread backtrace all'
+              printf ' %q' '-o'
+              printf ' %q' 'register read'
+              printf ' %q' '--'
+              printf ' %q\n' './repro_2745'
+              echo
+              echo "Environment:"
+              for item in "${repro_env[@]}"; do
+                echo "${item}"
+              done
+              echo
+            } | tee "${lldb_log}"
+
+            set +e
+            env "${repro_env[@]}" lldb --batch \
+              -o "settings set target.process.thread.step-avoid-regexp ^std::" \
+              -o "settings set target.output-path ${stdout_log}" \
+              -o "settings set target.error-path ${stdout_log}" \
+              -o "run" \
+              -o "thread backtrace all" \
+              -o "register read" \
+              -- ./repro_2745 >> "${lldb_log}" 2>&1
+            lldb_rc=$?
+            set -e
+            echo "lldb exit=${lldb_rc}" | tee -a "${lldb_log}"
+          fi
 
           exit "${status}"
 
