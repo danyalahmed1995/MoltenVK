@@ -632,10 +632,14 @@ jobs:
               printf ' %q' "settings set target.error-path ${stdout_log}"
               printf ' %q' '-o'
               printf ' %q' 'run'
-              printf ' %q' '-o'
+              printf ' %q' '-k'
               printf ' %q' 'thread backtrace all'
-              printf ' %q' '-o'
+              printf ' %q' '-k'
               printf ' %q' 'register read'
+              printf ' %q' '-k'
+              printf ' %q' 'frame variable'
+              printf ' %q' '-k'
+              printf ' %q' 'image lookup --address `$pc`'
               printf ' %q' '--'
               printf ' %q\n' './repro_2745'
               echo
@@ -652,8 +656,10 @@ jobs:
               -o "settings set target.output-path ${stdout_log}" \
               -o "settings set target.error-path ${stdout_log}" \
               -o "run" \
-              -o "thread backtrace all" \
-              -o "register read" \
+              -k "thread backtrace all" \
+              -k "register read" \
+              -k "frame variable" \
+              -k 'image lookup --address `$pc`' \
               -- ./repro_2745 >> "${lldb_log}" 2>&1
             lldb_rc=$?
             set -e
