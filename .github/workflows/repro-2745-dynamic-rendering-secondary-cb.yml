@@ -1,0 +1,558 @@
+name: Repro 2745 Dynamic Rendering Secondary CB
+
+on:
+  workflow_dispatch:
+
+jobs:
+  repro:
+    name: macOS MoltenVK dynamic rendering secondary CB repro
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Environment
+        run: |
+          mkdir -p repro-2745/logs
+          {
+            uname -a
+            sw_vers
+            xcodebuild -version
+            clang++ --version
+          } | tee repro-2745/logs/environment.log
+
+      - name: Compile and run Metal probe
+        run: |
+          cat > repro-2745/metal_probe.mm <<'EOF'
+          #import <Foundation/Foundation.h>
+          #import <Metal/Metal.h>
+
+          int main() {
+              @autoreleasepool {
+                  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+                  if (!device) {
+                      fprintf(stderr, "No Metal device found.\n");
+                      return 1;
+                  }
+                  printf("Metal device: %s\n", device.name.UTF8String);
+                  printf("Registry ID: %llu\n", device.registryID);
+                  return 0;
+              }
+          }
+          EOF
+          clang++ -ObjC++ repro-2745/metal_probe.mm -framework Metal -framework Foundation -o repro-2745/metal_probe
+          ./repro-2745/metal_probe 2>&1 | tee repro-2745/logs/metal-probe.log
+
+      - name: Cache Dependencies
+        id: cache-dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            External/build
+            !External/build/Intermediates
+          key: ${{ runner.os }}-${{ hashFiles('fetchDependencies','ExternalRevisions/**','ExternalDependencies.xcodeproj/**','Scripts/**') }}
+
+      - name: Fetch Dependencies (Use Built Cache)
+        if: steps.cache-dependencies.outputs.cache-hit == 'true'
+        run: ./fetchDependencies -v --none
+
+      - name: Fetch Dependencies
+        if: steps.cache-dependencies.outputs.cache-hit != 'true'
+        run: ./fetchDependencies -v --macos
+
+      - name: Output Dependency Build Logs on Failure
+        if: failure()
+        run: |
+          if [ -f dependenciesbuild.log ]; then
+            cat dependenciesbuild.log
+          fi
+
+      - name: Build MoltenVK from checkout
+        run: make macos
+
+      - name: Output MoltenVK Build Logs on Failure
+        if: failure()
+        run: |
+          if [ -f xcodebuild.log ]; then
+            cat xcodebuild.log
+          fi
+
+      - name: Create repro source and shaders
+        run: |
+          cat > repro-2745/tri.vert <<'EOF'
+          #version 450
+          vec2 positions[3] = vec2[](
+              vec2(-0.5, -0.5),
+              vec2( 0.5, -0.5),
+              vec2( 0.0,  0.5)
+          );
+          void main() {
+              gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
+          }
+          EOF
+
+          cat > repro-2745/tri.frag <<'EOF'
+          #version 450
+          layout(location = 0) out vec4 outColor;
+          void main() {
+              outColor = vec4(0.0, 0.7, 1.0, 1.0);
+          }
+          EOF
+
+          cat > repro-2745/repro_dynamic_rendering_secondary.cpp <<'EOF'
+          #include <vulkan/vulkan.h>
+
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <fstream>
+          #include <stdexcept>
+          #include <string>
+          #include <vector>
+
+          #define CHECK_VK(expr) do { \
+              VkResult _res = (expr); \
+              if (_res != VK_SUCCESS) { \
+                  std::fprintf(stderr, "%s failed: %d\n", #expr, _res); \
+                  std::exit(1); \
+              } \
+          } while (0)
+
+          static bool hasName(const std::vector<VkExtensionProperties>& props, const char* name) {
+              for (const auto& prop : props) {
+                  if (std::strcmp(prop.extensionName, name) == 0) { return true; }
+              }
+              return false;
+          }
+
+          static std::vector<uint32_t> readSpirv(const char* path) {
+              std::ifstream file(path, std::ios::binary | std::ios::ate);
+              if (!file) { throw std::runtime_error(std::string("Unable to open ") + path); }
+              auto size = file.tellg();
+              if (size <= 0 || (size % 4) != 0) { throw std::runtime_error(std::string("Invalid SPIR-V size for ") + path); }
+              std::vector<uint32_t> words(static_cast<size_t>(size) / 4);
+              file.seekg(0);
+              file.read(reinterpret_cast<char*>(words.data()), size);
+              return words;
+          }
+
+          static uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeBits, VkMemoryPropertyFlags flags) {
+              VkPhysicalDeviceMemoryProperties props{};
+              vkGetPhysicalDeviceMemoryProperties(physicalDevice, &props);
+              for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
+                  if ((typeBits & (1u << i)) && ((props.memoryTypes[i].propertyFlags & flags) == flags)) {
+                      return i;
+                  }
+              }
+              throw std::runtime_error("No matching memory type");
+          }
+
+          static VkShaderModule createShader(VkDevice device, const char* path) {
+              auto code = readSpirv(path);
+              VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+              ci.codeSize = code.size() * sizeof(uint32_t);
+              ci.pCode = code.data();
+              VkShaderModule shader = VK_NULL_HANDLE;
+              CHECK_VK(vkCreateShaderModule(device, &ci, nullptr, &shader));
+              return shader;
+          }
+
+          int main() {
+              uint32_t instExtCount = 0;
+              CHECK_VK(vkEnumerateInstanceExtensionProperties(nullptr, &instExtCount, nullptr));
+              std::vector<VkExtensionProperties> instExts(instExtCount);
+              CHECK_VK(vkEnumerateInstanceExtensionProperties(nullptr, &instExtCount, instExts.data()));
+
+              std::vector<const char*> instanceExtensions;
+              if (hasName(instExts, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+                  instanceExtensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+              } else {
+                  std::fprintf(stderr, "Missing %s\n", VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+                  return 1;
+              }
+
+              VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+              app.pApplicationName = "mvk-2745-repro";
+              app.apiVersion = VK_API_VERSION_1_2;
+
+              VkInstanceCreateInfo instCI{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+              instCI.pApplicationInfo = &app;
+              instCI.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+              instCI.enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size());
+              instCI.ppEnabledExtensionNames = instanceExtensions.data();
+
+              VkInstance instance = VK_NULL_HANDLE;
+              CHECK_VK(vkCreateInstance(&instCI, nullptr, &instance));
+
+              uint32_t physCount = 0;
+              CHECK_VK(vkEnumeratePhysicalDevices(instance, &physCount, nullptr));
+              if (physCount == 0) {
+                  std::fprintf(stderr, "No Vulkan physical devices found.\n");
+                  return 1;
+              }
+              std::vector<VkPhysicalDevice> physicalDevices(physCount);
+              CHECK_VK(vkEnumeratePhysicalDevices(instance, &physCount, physicalDevices.data()));
+              VkPhysicalDevice physicalDevice = physicalDevices[0];
+
+              VkPhysicalDeviceProperties physicalProps{};
+              vkGetPhysicalDeviceProperties(physicalDevice, &physicalProps);
+              std::printf("Physical device: %s\n", physicalProps.deviceName);
+
+              uint32_t queueFamilyCount = 0;
+              vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
+              std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+              vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, queueFamilies.data());
+              uint32_t graphicsQF = UINT32_MAX;
+              for (uint32_t i = 0; i < queueFamilyCount; i++) {
+                  if (queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+                      graphicsQF = i;
+                      break;
+                  }
+              }
+              if (graphicsQF == UINT32_MAX) {
+                  std::fprintf(stderr, "No graphics queue family found.\n");
+                  return 1;
+              }
+
+              uint32_t devExtCount = 0;
+              CHECK_VK(vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &devExtCount, nullptr));
+              std::vector<VkExtensionProperties> devExts(devExtCount);
+              CHECK_VK(vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &devExtCount, devExts.data()));
+
+              std::vector<const char*> deviceExtensions;
+              if (hasName(devExts, "VK_KHR_portability_subset")) {
+                  deviceExtensions.push_back("VK_KHR_portability_subset");
+              }
+              if (hasName(devExts, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)) {
+                  deviceExtensions.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+              } else {
+                  std::fprintf(stderr, "Missing %s\n", VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+                  return 1;
+              }
+
+              VkPhysicalDeviceDynamicRenderingFeatures dynamicRendering{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
+              dynamicRendering.dynamicRendering = VK_TRUE;
+
+              float priority = 1.0f;
+              VkDeviceQueueCreateInfo queueCI{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+              queueCI.queueFamilyIndex = graphicsQF;
+              queueCI.queueCount = 1;
+              queueCI.pQueuePriorities = &priority;
+
+              VkDeviceCreateInfo devCI{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+              devCI.pNext = &dynamicRendering;
+              devCI.queueCreateInfoCount = 1;
+              devCI.pQueueCreateInfos = &queueCI;
+              devCI.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
+              devCI.ppEnabledExtensionNames = deviceExtensions.data();
+
+              VkDevice device = VK_NULL_HANDLE;
+              CHECK_VK(vkCreateDevice(physicalDevice, &devCI, nullptr, &device));
+
+              auto fpCmdBeginRenderingKHR = reinterpret_cast<PFN_vkCmdBeginRenderingKHR>(vkGetDeviceProcAddr(device, "vkCmdBeginRenderingKHR"));
+              auto fpCmdEndRenderingKHR = reinterpret_cast<PFN_vkCmdEndRenderingKHR>(vkGetDeviceProcAddr(device, "vkCmdEndRenderingKHR"));
+              if (!fpCmdBeginRenderingKHR || !fpCmdEndRenderingKHR) {
+                  std::fprintf(stderr, "Dynamic rendering commands are unavailable.\n");
+                  return 1;
+              }
+
+              VkQueue queue = VK_NULL_HANDLE;
+              vkGetDeviceQueue(device, graphicsQF, 0, &queue);
+
+              constexpr VkFormat colorFormat = VK_FORMAT_R8G8B8A8_UNORM;
+              constexpr uint32_t width = 64;
+              constexpr uint32_t height = 64;
+
+              VkImageCreateInfo imageCI{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+              imageCI.imageType = VK_IMAGE_TYPE_2D;
+              imageCI.format = colorFormat;
+              imageCI.extent = {width, height, 1};
+              imageCI.mipLevels = 1;
+              imageCI.arrayLayers = 1;
+              imageCI.samples = VK_SAMPLE_COUNT_1_BIT;
+              imageCI.tiling = VK_IMAGE_TILING_OPTIMAL;
+              imageCI.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+              imageCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+              VkImage image = VK_NULL_HANDLE;
+              CHECK_VK(vkCreateImage(device, &imageCI, nullptr, &image));
+
+              VkMemoryRequirements memReq{};
+              vkGetImageMemoryRequirements(device, image, &memReq);
+
+              VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+              allocInfo.allocationSize = memReq.size;
+              allocInfo.memoryTypeIndex = findMemoryType(physicalDevice, memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+              VkDeviceMemory imageMemory = VK_NULL_HANDLE;
+              CHECK_VK(vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory));
+              CHECK_VK(vkBindImageMemory(device, image, imageMemory, 0));
+
+              VkImageViewCreateInfo imageViewCI{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+              imageViewCI.image = image;
+              imageViewCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
+              imageViewCI.format = colorFormat;
+              imageViewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              imageViewCI.subresourceRange.levelCount = 1;
+              imageViewCI.subresourceRange.layerCount = 1;
+              VkImageView imageView = VK_NULL_HANDLE;
+              CHECK_VK(vkCreateImageView(device, &imageViewCI, nullptr, &imageView));
+
+              VkShaderModule vert = createShader(device, "tri.vert.spv");
+              VkShaderModule frag = createShader(device, "tri.frag.spv");
+
+              VkPipelineShaderStageCreateInfo stages[2]{};
+              stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+              stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+              stages[0].module = vert;
+              stages[0].pName = "main";
+              stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+              stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+              stages[1].module = frag;
+              stages[1].pName = "main";
+
+              VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+              VkPipelineInputAssemblyStateCreateInfo inputAssembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+              inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+              VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+              viewportState.viewportCount = 1;
+              viewportState.scissorCount = 1;
+
+              VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+              raster.polygonMode = VK_POLYGON_MODE_FILL;
+              raster.cullMode = VK_CULL_MODE_NONE;
+              raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+              raster.lineWidth = 1.0f;
+
+              VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+              multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+              VkPipelineColorBlendAttachmentState blendAttachment{};
+              blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+              VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+              blend.attachmentCount = 1;
+              blend.pAttachments = &blendAttachment;
+
+              VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+              VkPipelineDynamicStateCreateInfo dynamicState{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+              dynamicState.dynamicStateCount = 2;
+              dynamicState.pDynamicStates = dynamicStates;
+
+              VkPipelineLayoutCreateInfo layoutCI{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+              VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+              CHECK_VK(vkCreatePipelineLayout(device, &layoutCI, nullptr, &pipelineLayout));
+
+              VkPipelineRenderingCreateInfo renderingCI{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+              renderingCI.colorAttachmentCount = 1;
+              renderingCI.pColorAttachmentFormats = &colorFormat;
+
+              VkGraphicsPipelineCreateInfo pipelineCI{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+              pipelineCI.pNext = &renderingCI;
+              pipelineCI.stageCount = 2;
+              pipelineCI.pStages = stages;
+              pipelineCI.pVertexInputState = &vertexInput;
+              pipelineCI.pInputAssemblyState = &inputAssembly;
+              pipelineCI.pViewportState = &viewportState;
+              pipelineCI.pRasterizationState = &raster;
+              pipelineCI.pMultisampleState = &multisample;
+              pipelineCI.pColorBlendState = &blend;
+              pipelineCI.pDynamicState = &dynamicState;
+              pipelineCI.layout = pipelineLayout;
+              pipelineCI.renderPass = VK_NULL_HANDLE;
+
+              VkPipeline pipeline = VK_NULL_HANDLE;
+              CHECK_VK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineCI, nullptr, &pipeline));
+
+              VkCommandPoolCreateInfo poolCI{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+              poolCI.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+              poolCI.queueFamilyIndex = graphicsQF;
+              VkCommandPool pool = VK_NULL_HANDLE;
+              CHECK_VK(vkCreateCommandPool(device, &poolCI, nullptr, &pool));
+
+              VkCommandBufferAllocateInfo primaryAlloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+              primaryAlloc.commandPool = pool;
+              primaryAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+              primaryAlloc.commandBufferCount = 1;
+              VkCommandBuffer primary = VK_NULL_HANDLE;
+              CHECK_VK(vkAllocateCommandBuffers(device, &primaryAlloc, &primary));
+
+              VkCommandBufferAllocateInfo secondaryAlloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+              secondaryAlloc.commandPool = pool;
+              secondaryAlloc.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+              secondaryAlloc.commandBufferCount = 1;
+              VkCommandBuffer secondary = VK_NULL_HANDLE;
+              CHECK_VK(vkAllocateCommandBuffers(device, &secondaryAlloc, &secondary));
+
+              VkCommandBufferInheritanceRenderingInfo inheritRendering{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO};
+              inheritRendering.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+              inheritRendering.colorAttachmentCount = 1;
+              inheritRendering.pColorAttachmentFormats = &colorFormat;
+
+              VkCommandBufferInheritanceInfo inheritInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
+              inheritInfo.pNext = &inheritRendering;
+              inheritInfo.renderPass = VK_NULL_HANDLE;
+              inheritInfo.subpass = 0;
+              inheritInfo.framebuffer = VK_NULL_HANDLE;
+
+              VkCommandBufferBeginInfo secondaryBegin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+              secondaryBegin.flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+              secondaryBegin.pInheritanceInfo = &inheritInfo;
+              CHECK_VK(vkBeginCommandBuffer(secondary, &secondaryBegin));
+              VkViewport viewport{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
+              VkRect2D scissor{{0, 0}, {width, height}};
+              vkCmdBindPipeline(secondary, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+              vkCmdSetViewport(secondary, 0, 1, &viewport);
+              vkCmdSetScissor(secondary, 0, 1, &scissor);
+              vkCmdDraw(secondary, 3, 1, 0, 0);
+              CHECK_VK(vkEndCommandBuffer(secondary));
+
+              VkCommandBufferBeginInfo primaryBegin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+              CHECK_VK(vkBeginCommandBuffer(primary, &primaryBegin));
+
+              VkImageMemoryBarrier toColor{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+              toColor.srcAccessMask = 0;
+              toColor.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+              toColor.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+              toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+              toColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              toColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              toColor.image = image;
+              toColor.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              toColor.subresourceRange.levelCount = 1;
+              toColor.subresourceRange.layerCount = 1;
+              vkCmdPipelineBarrier(primary,
+                                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                   0, 0, nullptr, 0, nullptr, 1, &toColor);
+
+              VkClearValue clear{};
+              clear.color.float32[0] = 0.05f;
+              clear.color.float32[1] = 0.05f;
+              clear.color.float32[2] = 0.05f;
+              clear.color.float32[3] = 1.0f;
+
+              VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+              colorAttachment.imageView = imageView;
+              colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+              colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+              colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+              colorAttachment.clearValue = clear;
+
+              VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+              renderingInfo.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+              renderingInfo.renderArea = {{0, 0}, {width, height}};
+              renderingInfo.layerCount = 1;
+              renderingInfo.colorAttachmentCount = 1;
+              renderingInfo.pColorAttachments = &colorAttachment;
+
+              fpCmdBeginRenderingKHR(primary, &renderingInfo);
+              vkCmdExecuteCommands(primary, 1, &secondary);
+              fpCmdEndRenderingKHR(primary);
+
+              VkImageMemoryBarrier toGeneral{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+              toGeneral.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+              toGeneral.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+              toGeneral.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+              toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+              toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              toGeneral.image = image;
+              toGeneral.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              toGeneral.subresourceRange.levelCount = 1;
+              toGeneral.subresourceRange.layerCount = 1;
+              vkCmdPipelineBarrier(primary,
+                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                   VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                   0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+
+              CHECK_VK(vkEndCommandBuffer(primary));
+
+              VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+              submit.commandBufferCount = 1;
+              submit.pCommandBuffers = &primary;
+              CHECK_VK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+              CHECK_VK(vkQueueWaitIdle(queue));
+
+              std::puts("Dynamic rendering secondary command buffer repro completed.");
+
+              vkDestroyCommandPool(device, pool, nullptr);
+              vkDestroyPipeline(device, pipeline, nullptr);
+              vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+              vkDestroyShaderModule(device, frag, nullptr);
+              vkDestroyShaderModule(device, vert, nullptr);
+              vkDestroyImageView(device, imageView, nullptr);
+              vkDestroyImage(device, image, nullptr);
+              vkFreeMemory(device, imageMemory, nullptr);
+              vkDestroyDevice(device, nullptr);
+              vkDestroyInstance(instance, nullptr);
+              return 0;
+          }
+          EOF
+
+      - name: Build repro
+        run: |
+          if ! command -v glslangValidator >/dev/null 2>&1; then
+            brew install glslang
+          fi
+
+          cd repro-2745
+          glslangValidator -V --target-env vulkan1.2 -o tri.vert.spv tri.vert
+          glslangValidator -V --target-env vulkan1.2 -o tri.frag.spv tri.frag
+
+          MVK_DYLIB="../Package/Latest/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib"
+          MVK_INCLUDE="../Package/Latest/MoltenVK/include"
+          test -f "${MVK_DYLIB}"
+          test -d "${MVK_INCLUDE}"
+
+          clang++ -std=c++17 -O0 -g repro_dynamic_rendering_secondary.cpp \
+            -I"${MVK_INCLUDE}" \
+            -L"$(dirname "${MVK_DYLIB}")" \
+            -lMoltenVK \
+            -framework Metal \
+            -framework Foundation \
+            -framework QuartzCore \
+            -framework IOSurface \
+            -Wl,-rpath,"$(cd "$(dirname "${MVK_DYLIB}")" && pwd)" \
+            -o repro_2745
+
+      - name: Run repro with MoltenVK prefill modes
+        run: |
+          cd repro-2745
+          MVK_LIB_DIR="$(cd ../Package/Latest/MoltenVK/dynamic/dylib/macOS && pwd)"
+          status=0
+
+          for prefill in 0 1 2; do
+            log="logs/run-prefill-${prefill}.log"
+            echo "Running with MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=${prefill}" | tee "${log}"
+            set +e
+            DYLD_LIBRARY_PATH="${MVK_LIB_DIR}:${DYLD_LIBRARY_PATH:-}" \
+              MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS="${prefill}" \
+              MVK_CONFIG_LOG_LEVEL=3 \
+              MVK_CONFIG_DEBUG=1 \
+              ./repro_2745 >> "${log}" 2>&1
+            rc=$?
+            set -e
+            echo "exit=${rc}" | tee -a "${log}"
+            if [ "${rc}" -ne 0 ]; then
+              status="${rc}"
+            fi
+          done
+
+          exit "${status}"
+
+      - name: Upload repro logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-2745-logs
+          path: |
+            repro-2745/logs/**
+            xcodebuild.log
+            dependenciesbuild.log
+          if-no-files-found: ignore
