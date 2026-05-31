@@ -165,18 +165,39 @@ jobs:
               return shader;
           }
 
+          static void printEnv(const char* name) {
+              const char* value = std::getenv(name);
+              std::printf("%s=%s\n", name, value ? value : "");
+          }
+
           int main() {
+              printEnv("VK_ICD_FILENAMES");
+              printEnv("DYLD_LIBRARY_PATH");
+              printEnv("MVK_DYLIB_PATH");
+              printEnv("MVK_ICD_JSON_PATH");
+
               uint32_t instExtCount = 0;
-              CHECK_VK(vkEnumerateInstanceExtensionProperties(nullptr, &instExtCount, nullptr));
+              VkResult instExtCountResult = vkEnumerateInstanceExtensionProperties(nullptr, &instExtCount, nullptr);
+              std::printf("vkEnumerateInstanceExtensionProperties(count) = %d, count = %u\n", instExtCountResult, instExtCount);
+              CHECK_VK(instExtCountResult);
               std::vector<VkExtensionProperties> instExts(instExtCount);
-              CHECK_VK(vkEnumerateInstanceExtensionProperties(nullptr, &instExtCount, instExts.data()));
+              VkResult instExtListResult = vkEnumerateInstanceExtensionProperties(nullptr, &instExtCount, instExts.data());
+              std::printf("vkEnumerateInstanceExtensionProperties(list) = %d, count = %u\n", instExtListResult, instExtCount);
+              CHECK_VK(instExtListResult);
+
+              std::puts("Instance extensions:");
+              for (const auto& ext : instExts) {
+                  std::printf("  %s specVersion=%u\n", ext.extensionName, ext.specVersion);
+              }
 
               std::vector<const char*> instanceExtensions;
               if (hasName(instExts, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
                   instanceExtensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+                  std::printf("Enabling %s and VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR.\n",
+                              VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
               } else {
-                  std::fprintf(stderr, "Missing %s\n", VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-                  return 1;
+                  std::printf("%s not advertised; continuing without portability enumeration.\n",
+                              VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
               }
 
               VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -185,21 +206,27 @@ jobs:
 
               VkInstanceCreateInfo instCI{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
               instCI.pApplicationInfo = &app;
-              instCI.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+              instCI.flags = instanceExtensions.empty() ? 0 : VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
               instCI.enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size());
               instCI.ppEnabledExtensionNames = instanceExtensions.data();
 
               VkInstance instance = VK_NULL_HANDLE;
-              CHECK_VK(vkCreateInstance(&instCI, nullptr, &instance));
+              VkResult createInstanceResult = vkCreateInstance(&instCI, nullptr, &instance);
+              std::printf("vkCreateInstance = %d\n", createInstanceResult);
+              CHECK_VK(createInstanceResult);
 
               uint32_t physCount = 0;
-              CHECK_VK(vkEnumeratePhysicalDevices(instance, &physCount, nullptr));
+              VkResult physCountResult = vkEnumeratePhysicalDevices(instance, &physCount, nullptr);
+              std::printf("vkEnumeratePhysicalDevices(count) = %d, count = %u\n", physCountResult, physCount);
+              CHECK_VK(physCountResult);
               if (physCount == 0) {
                   std::fprintf(stderr, "No Vulkan physical devices found.\n");
                   return 1;
               }
               std::vector<VkPhysicalDevice> physicalDevices(physCount);
-              CHECK_VK(vkEnumeratePhysicalDevices(instance, &physCount, physicalDevices.data()));
+              VkResult physListResult = vkEnumeratePhysicalDevices(instance, &physCount, physicalDevices.data());
+              std::printf("vkEnumeratePhysicalDevices(list) = %d, count = %u\n", physListResult, physCount);
+              CHECK_VK(physListResult);
               VkPhysicalDevice physicalDevice = physicalDevices[0];
 
               VkPhysicalDeviceProperties physicalProps{};
@@ -508,7 +535,10 @@ jobs:
           glslangValidator -V --target-env vulkan1.2 -o tri.vert.spv tri.vert
           glslangValidator -V --target-env vulkan1.2 -o tri.frag.spv tri.frag
 
-          MVK_DYLIB="../Package/Latest/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib"
+          MVK_DYLIB="../Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib"
+          if [ ! -f "${MVK_DYLIB}" ]; then
+            MVK_DYLIB="../Package/Latest/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib"
+          fi
           MVK_INCLUDE="../Package/Latest/MoltenVK/include"
           test -f "${MVK_DYLIB}"
           test -d "${MVK_INCLUDE}"
@@ -527,18 +557,44 @@ jobs:
       - name: Run repro with MoltenVK prefill modes
         run: |
           cd repro-2745
-          MVK_LIB_DIR="$(cd ../Package/Latest/MoltenVK/dynamic/dylib/macOS && pwd)"
+          MVK_LIB_DIR="../Package/Release/MoltenVK/dynamic/dylib/macOS"
+          if [ ! -d "${MVK_LIB_DIR}" ]; then
+            MVK_LIB_DIR="../Package/Latest/MoltenVK/dynamic/dylib/macOS"
+          fi
+          MVK_LIB_DIR="$(cd "${MVK_LIB_DIR}" && pwd)"
+          MVK_DYLIB="${MVK_LIB_DIR}/libMoltenVK.dylib"
+          MVK_ICD_JSON="${MVK_LIB_DIR}/MoltenVK_icd.json"
+          if [ ! -f "${MVK_ICD_JSON}" ]; then
+            MVK_ICD_JSON="$(find ../Package -path '*/MoltenVK_icd.json' -print -quit)"
+          fi
+
+          {
+            echo "MoltenVK library dir: ${MVK_LIB_DIR}"
+            echo "MoltenVK dylib: ${MVK_DYLIB}"
+            echo "MoltenVK ICD JSON: ${MVK_ICD_JSON}"
+            echo "Initial VK_ICD_FILENAMES=${VK_ICD_FILENAMES:-}"
+            echo "Initial DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH:-}"
+            find ../Package -path '*MoltenVK*' \( -name 'libMoltenVK.dylib' -o -name 'MoltenVK_icd.json' \) -print
+          } | tee logs/loader-paths.log
+
           status=0
 
           for prefill in 0 1 2; do
             log="logs/run-prefill-${prefill}.log"
             echo "Running with MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=${prefill}" | tee "${log}"
+            run_env=(
+              "DYLD_LIBRARY_PATH=${MVK_LIB_DIR}:${DYLD_LIBRARY_PATH:-}"
+              "MVK_DYLIB_PATH=${MVK_DYLIB}"
+              "MVK_ICD_JSON_PATH=${MVK_ICD_JSON}"
+              "MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=${prefill}"
+              "MVK_CONFIG_LOG_LEVEL=3"
+              "MVK_CONFIG_DEBUG=1"
+            )
+            if [ -n "${MVK_ICD_JSON}" ] && [ -f "${MVK_ICD_JSON}" ]; then
+              run_env+=("VK_ICD_FILENAMES=${MVK_ICD_JSON}")
+            fi
             set +e
-            DYLD_LIBRARY_PATH="${MVK_LIB_DIR}:${DYLD_LIBRARY_PATH:-}" \
-              MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS="${prefill}" \
-              MVK_CONFIG_LOG_LEVEL=3 \
-              MVK_CONFIG_DEBUG=1 \
-              ./repro_2745 >> "${log}" 2>&1
+            env "${run_env[@]}" ./repro_2745 >> "${log}" 2>&1
             rc=$?
             set -e
             echo "exit=${rc}" | tee -a "${log}"
